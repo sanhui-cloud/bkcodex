@@ -103,6 +103,12 @@ class Config:
         for path in (self.state,self.home,self.state/'runs',self.state/'workers'):
             path.mkdir(parents=True,exist_ok=True); path.chmod(0o700)
         # A dedicated login directory starts empty and is authenticated by `login`.
+        try:
+            with (self.home/'config.toml').open('x') as f:
+                f.write('cli_auth_credentials_store = "file"\n')
+            (self.home/'config.toml').chmod(0o600)
+        except FileExistsError:
+            pass
         Queue(self)
 
     def env(self):

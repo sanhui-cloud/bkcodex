@@ -97,6 +97,7 @@ retry_delay_seconds=0
 
     def test_isolated_home_fresh_sessions_and_service_quoting(self):
         self.assertNotEqual(self.cfg.env()['CODEX_HOME'],str(Path.home()/'.codex'))
+        self.assertIn('cli_auth_credentials_store = "file"',(self.cfg.home/'config.toml').read_text())
         args=cli_args(self.cfg,self.root/'run');self.assertNotIn('resume',args)
         self.assertIn('model_reasoning_effort="high"',args)
         text=unit_text(self.cfg,'worker-01')
