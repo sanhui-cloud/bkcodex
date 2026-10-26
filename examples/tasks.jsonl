@@ -1,0 +1,2 @@
+{"id":"example-01","prompt_file":"task.md","payload":{"title":"数据批次准备","items":["核对输入路径","保存处理记录","检查输出文件"]}}
+{"id":"example-02","prompt_file":"task.md","payload":{"title":"实验准备","items":["固定数据版本","记录模型配置","保存评测指标"]}}

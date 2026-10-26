@@ -1,0 +1,38 @@
+[project]
+name = "demo"
+workspace = "."
+# Paths are relative to this configuration file; ~ and environment variables work.
+state_dir = "~/.local/state/bkcodex/demo"
+
+[codex]
+binary = "codex"
+home = "~/.local/state/bkcodex/demo/codex-home"
+model = "gpt-6.1-sol"
+reasoning_effort = "high"
+service_tier = "priority"
+sandbox = "workspace-write"
+# Standalone mode in the CLI version used by the source deployment.
+# Set [] if your CLI does not support this global option.
+global_args = ["--no-daemon"]
+writable_dirs = []
+
+[workers]
+count = 3
+max_attempts = 2
+task_timeout_seconds = 1800
+max_runtime_hours = 24
+retry_delay_seconds = 120
+
+# Optional proxy configuration. Credentials belong in local files.
+[environment]
+# https_proxy = "http://127.0.0.1:7890"
+# http_proxy = "http://127.0.0.1:7890"
+# all_proxy = "http://127.0.0.1:7890"
+# NO_PROXY = "localhost,127.0.0.1"
+
+# Domain validation runs after the task result and artifacts exist.
+# Every entry is one argv element; no shell expansion is performed.
+[validation]
+command = []
+# command = ["python3", "tools/validate.py", "{task}", "{result}"]
+timeout_seconds = 120
