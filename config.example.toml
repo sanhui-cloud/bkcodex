@@ -5,6 +5,9 @@ workspace = "."
 state_dir = "~/.local/state/bkcodex/demo"
 
 [codex]
+# On Linux: "codex" or "/usr/local/bin/codex"
+# On Windows: "codex", "codex.exe", or the Codex Desktop CLI path (use forward slashes in TOML),
+# e.g. "C:/Program Files/WindowsApps/OpenAI.Codex_.../app/resources/codex.exe"
 binary = "codex"
 home = "~/.local/state/bkcodex/demo/codex-home"
 model = "gpt-6.1-sol"
@@ -34,5 +37,5 @@ retry_delay_seconds = 120
 # Every entry is one argv element; no shell expansion is performed.
 [validation]
 command = []
-# command = ["python3", "tools/validate.py", "{task}", "{result}"]
+# command = ["python", "examples/validate_markdown.py", "{task}", "{result}"]
 timeout_seconds = 120

@@ -3,20 +3,28 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import fcntl
 import json
 import os
 from pathlib import Path
+import queue as pyqueue
 import re
-import selectors
 import shutil
 import signal
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
+
+IS_WINDOWS = os.name == 'nt'
+if IS_WINDOWS:
+    import ctypes
+    import msvcrt
+else:
+    import fcntl
+    import selectors
 
 
 def now():
@@ -33,7 +41,7 @@ def save(path, data):
     path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp = tempfile.mkstemp(prefix=path.name+'.', dir=path.parent)
     try:
-        with os.fdopen(fd, 'w') as f:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2, allow_nan=False)
             f.write('\n'); f.flush(); os.fsync(f.fileno())
         os.replace(temp, path)
@@ -42,12 +50,91 @@ def save(path, data):
 
 
 def load(path):
-    return json.loads(Path(path).read_text())
+    return json.loads(Path(path).read_text(encoding='utf-8'))
 
 
 def resolved(value, base):
     p = Path(os.path.expandvars(str(value))).expanduser()
     return (base/p).resolve() if not p.is_absolute() else p.resolve()
+
+
+def is_pid_alive(pid):
+    if not pid or int(pid) <= 0:
+        return False
+    pid = int(pid)
+    if IS_WINDOWS:
+        process_query_limited = 0x1000
+        still_active = 259
+        handle = ctypes.windll.kernel32.OpenProcess(process_query_limited, False, pid)
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return code.value == still_active
+            return False
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    proc_dir = Path('/proc')
+    if proc_dir.is_dir():
+        return (proc_dir / str(pid)).exists()
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def kill_process_tree(pid):
+    if not pid or int(pid) <= 0:
+        return
+    pid = int(pid)
+    if IS_WINDOWS:
+        subprocess.run(
+            ['taskkill', '/F', '/T', '/PID', str(pid)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    else:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+
+@contextmanager
+def file_lock(path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if IS_WINDOWS:
+        with path.open('a+b') as lock:
+            lock.seek(0, os.SEEK_END)
+            if lock.tell() == 0:
+                lock.write(b'\0')
+                lock.flush()
+            lock.seek(0)
+            try:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise BlockingIOError(f'Worker lock already held: {path}') from exc
+            try:
+                yield
+            finally:
+                lock.seek(0)
+                try:
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+    else:
+        with path.open('a', encoding='utf-8') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 @dataclass(frozen=True)
@@ -58,7 +145,7 @@ class Config:
     @classmethod
     def read(cls, path):
         path = Path(path).expanduser().resolve()
-        data = tomllib.loads(path.read_text())
+        data = tomllib.loads(path.read_text(encoding='utf-8'))
         name_checked(data['project']['name'])
         cfg = cls(path, data)
         if not cfg.workspace.is_dir(): raise ValueError('Workspace directory does not exist')
@@ -93,27 +180,33 @@ class Config:
     def runtime_hours(self): return float(self.data.get('workers',{}).get('max_runtime_hours',24))
     @property
     def binary(self):
-        value = self.codex.get('binary','codex')
-        if '/' in value: return str(resolved(value,self.path.parent))
+        value = str(self.codex.get('binary','codex'))
+        if '/' in value or '\\' in value: return str(resolved(value,self.path.parent))
         return shutil.which(value) or value
     @property
     def roles(self): return [f'worker-{i:02}' for i in range(1,self.workers+1)]
 
     def init(self):
-        for path in (self.state,self.home,self.state/'runs',self.state/'workers'):
-            path.mkdir(parents=True,exist_ok=True); path.chmod(0o700)
+        dirs = [self.state, self.home, self.state/'runs', self.state/'workers']
+        if IS_WINDOWS:
+            dirs.append(self.state/'logs')
+        for path in dirs:
+            path.mkdir(parents=True, exist_ok=True)
+            if not IS_WINDOWS:
+                path.chmod(0o700)
         # A dedicated login directory starts empty and is authenticated by `login`.
         try:
-            with (self.home/'config.toml').open('x') as f:
+            with (self.home/'config.toml').open('x', encoding='utf-8') as f:
                 f.write('cli_auth_credentials_store = "file"\n')
-            (self.home/'config.toml').chmod(0o600)
+            if not IS_WINDOWS:
+                (self.home/'config.toml').chmod(0o600)
         except FileExistsError:
             pass
         Queue(self)
 
     def env(self):
         env={k:v for k,v in os.environ.items() if not k.startswith(('CODEX_','VSCODE_'))}
-        env.update(CODEX_HOME=str(self.home),CODEX_SQLITE_HOME=str(self.home),PYTHONUNBUFFERED='1')
+        env.update(CODEX_HOME=str(self.home),CODEX_SQLITE_HOME=str(self.home),PYTHONUNBUFFERED='1',PYTHONUTF8='1')
         env.update({str(k):str(v) for k,v in self.data.get('environment',{}).items()})
         if env['CODEX_HOME'] != str(self.home) or env['CODEX_SQLITE_HOME'] != str(self.home):
             raise ValueError('Configure Codex home in [codex]')
@@ -200,7 +293,7 @@ class Queue:
             row=db.execute('SELECT status FROM tasks WHERE id=?',(task_id,)).fetchone()
             if row is None or row['status'] not in ('blocked','needs_input','interrupted'):
                 raise ValueError('Retry requires blocked, needs_input or interrupted task')
-            db.execute("UPDATE tasks SET status='queued',owner=NULL,attempts=0,updated=? WHERE id=?",(now(),task_id))
+            db.execute("UPDATE tasks SET status='queued',owner=NULL,attempts=0,error='',updated=? WHERE id=?",(now(),task_id))
             self.event(db,task_id,'manual_retry')
 
     def rows(self):
@@ -227,6 +320,19 @@ def failure_kind(message):
     return 'work'
 
 
+def resolve_artifact(raw, run_dir, workspace):
+    p = Path(os.path.expandvars(str(raw))).expanduser()
+    if p.is_absolute():
+        return p.resolve()
+    cand_run = (run_dir / p).resolve()
+    if cand_run.is_file():
+        return cand_run
+    cand_ws = (workspace / p).resolve()
+    if cand_ws.is_file():
+        return cand_ws
+    return cand_run
+
+
 def validate_result(cfg,run_dir,task):
     path=run_dir/'result.json'
     result=load(path)
@@ -237,14 +343,14 @@ def validate_result(cfg,run_dir,task):
     if not isinstance(artifacts,list): raise ValueError('Result artifacts must be a list')
     if result['status']=='completed' and not artifacts: raise ValueError('Completed tasks require artifacts')
     for raw in artifacts:
-        artifact=resolved(raw,run_dir)
+        artifact=resolve_artifact(raw,run_dir,cfg.workspace)
         if not any(artifact.is_relative_to(root) for root in (cfg.state,cfg.workspace)):
             raise ValueError('Artifact must be within state or workspace')
         if not artifact.is_file(): raise ValueError('Artifact missing: '+str(artifact))
     command=cfg.data.get('validation',{}).get('command',[])
     if command and result['status']=='completed':
         argv=[arg.replace('{task}',str(run_dir/'task.json')).replace('{result}',str(path)).replace('{run_dir}',str(run_dir)) for arg in command]
-        with (run_dir/'validation.log').open('w') as log:
+        with (run_dir/'validation.log').open('w', encoding='utf-8') as log:
             process=subprocess.run(argv,cwd=cfg.workspace,env=cfg.env(),stdout=log,stderr=subprocess.STDOUT,
                 timeout=int(cfg.data.get('validation',{}).get('timeout_seconds',120)))
         if process.returncode: raise ValueError('Domain validator failed; see validation.log')
@@ -268,59 +374,102 @@ def task_prompt(task,run_dir):
 '''
 
 
+def _handle_event_line(text, owner, events, result, progress, worker_file):
+    events.write(text+'\n'); events.flush()
+    try: event=json.loads(text)
+    except ValueError: return
+    if event.get('type')=='thread.started': result['thread_id']=event.get('thread_id')
+    if event.get('type')=='turn.completed': result['usage']=event.get('usage',{})
+    if event.get('type') in ('turn.failed','error'):
+        error=event.get('error',{})
+        result['error']=error.get('message','') if isinstance(error,dict) else str(error)
+        result['error']=result['error'] or event.get('message','')
+    item=event.get('item',{})
+    if event.get('type')=='item.completed' and item.get('type')=='error': result['error']=item.get('message','')
+    if event.get('type')=='item.completed' and item.get('type')=='agent_message':
+        print(f"[{owner}] {item.get('text','')}",flush=True)
+    progress.update(last_event=now(),thread_id=result['thread_id']);save(worker_file,progress)
+
+
 def execute(cfg,task,owner):
     stamp=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
     run_dir=cfg.state/'runs'/task['id']/stamp; run_dir.mkdir(parents=True)
     task=dict(task,payload=json.loads(task['payload']))
     save(run_dir/'task.json',task)
     Queue(cfg).running_dir(task['id'],owner,run_dir)
-    prompt=task_prompt(task,run_dir); (run_dir/'instruction.txt').write_text(prompt)
+    prompt=task_prompt(task,run_dir); (run_dir/'instruction.txt').write_text(prompt, encoding='utf-8')
     progress=dict(worker=owner,pid=os.getpid(),state='running',task_id=task['id'],run_dir=str(run_dir),started=now())
     worker_file=cfg.state/'workers'/(owner+'.json'); save(worker_file,progress)
     result=dict(returncode=None,usage={},error='',run_dir=str(run_dir),thread_id=None)
     deadline=time.monotonic()+cfg.task_timeout; interrupted=False; timed_out=False
-    with (run_dir/'events.jsonl').open('w') as events,(run_dir/'stderr.log').open('w') as stderr:
+    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if IS_WINDOWS else 0
+    with (run_dir/'events.jsonl').open('w', encoding='utf-8') as events, (run_dir/'stderr.log').open('w', encoding='utf-8') as stderr:
         proc=subprocess.Popen(cli_args(cfg,run_dir),cwd=cfg.workspace,env=cfg.env(),text=False,
-            stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=stderr,start_new_session=True)
+            stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=stderr,
+            creationflags=creationflags,start_new_session=not IS_WINDOWS)
         progress['codex_pid']=proc.pid;save(worker_file,progress)
-        proc.stdin.write(prompt.encode()); proc.stdin.close()
-        selector=selectors.DefaultSelector(); selector.register(proc.stdout,selectors.EVENT_READ)
-        buffer=b''
-        try:
-            while selector.get_map():
-                if time.monotonic()>deadline:
-                    timed_out=True; result['error']='task timeout'; break
-                for key,_ in selector.select(timeout=1):
-                    chunk=os.read(key.fd,65536)
-                    if not chunk:
-                        selector.unregister(key.fileobj); continue
-                    buffer+=chunk
-                    while b'\n' in buffer:
-                        line,buffer=buffer.split(b'\n',1)
-                        text=line.decode(errors='replace');events.write(text+'\n');events.flush()
-                        try: event=json.loads(text)
-                        except ValueError: continue
-                        if event.get('type')=='thread.started': result['thread_id']=event.get('thread_id')
-                        if event.get('type')=='turn.completed': result['usage']=event.get('usage',{})
-                        if event.get('type') in ('turn.failed','error'):
-                            error=event.get('error',{})
-                            result['error']=error.get('message','') if isinstance(error,dict) else str(error)
-                            result['error']=result['error'] or event.get('message','')
-                        item=event.get('item',{})
-                        if event.get('type')=='item.completed' and item.get('type')=='error': result['error']=item.get('message','')
-                        if event.get('type')=='item.completed' and item.get('type')=='agent_message':
-                            print(f"[{owner}] {item.get('text','')}",flush=True)
-                        progress.update(last_event=now(),thread_id=result['thread_id']);save(worker_file,progress)
-        except (KeyboardInterrupt,SystemExit):
-            interrupted=True;result['error']='worker interrupted'
-        finally:
-            selector.close()
-            if proc.poll() is None and (interrupted or timed_out):
-                os.killpg(proc.pid,signal.SIGINT)
-                try: proc.wait(timeout=10)
-                except subprocess.TimeoutExpired: os.killpg(proc.pid,signal.SIGKILL)
-            result['returncode']=proc.wait();proc.stdout.close()
-            if buffer: events.write(buffer.decode(errors='replace'))
+        proc.stdin.write(prompt.encode('utf-8')); proc.stdin.close()
+        if IS_WINDOWS:
+            lines_q: pyqueue.Queue[bytes | None] = pyqueue.Queue()
+            def reader():
+                try:
+                    while True:
+                        line = proc.stdout.readline()
+                        if not line:
+                            break
+                        lines_q.put(line)
+                finally:
+                    lines_q.put(None)
+            thread = threading.Thread(target=reader, daemon=True)
+            thread.start()
+            try:
+                while True:
+                    if time.monotonic() > deadline:
+                        timed_out=True; result['error']='task timeout'; break
+                    try:
+                        raw_line = lines_q.get(timeout=0.5)
+                    except pyqueue.Empty:
+                        if proc.poll() is not None and not thread.is_alive():
+                            break
+                        continue
+                    if raw_line is None:
+                        break
+                    text = raw_line.decode('utf-8', errors='replace').rstrip('\r\n')
+                    _handle_event_line(text, owner, events, result, progress, worker_file)
+            except (KeyboardInterrupt,SystemExit):
+                interrupted=True;result['error']='worker interrupted'
+            finally:
+                if proc.poll() is None and (interrupted or timed_out):
+                    kill_process_tree(proc.pid)
+                result['returncode']=proc.wait()
+                thread.join(timeout=2)
+                proc.stdout.close()
+        else:
+            selector=selectors.DefaultSelector(); selector.register(proc.stdout,selectors.EVENT_READ)
+            buffer=b''
+            try:
+                while selector.get_map():
+                    if time.monotonic()>deadline:
+                        timed_out=True; result['error']='task timeout'; break
+                    for key,_ in selector.select(timeout=1):
+                        chunk=os.read(key.fd,65536)
+                        if not chunk:
+                            selector.unregister(key.fileobj); continue
+                        buffer+=chunk
+                        while b'\n' in buffer:
+                            line,buffer=buffer.split(b'\n',1)
+                            text=line.decode('utf-8', errors='replace').rstrip('\r')
+                            _handle_event_line(text, owner, events, result, progress, worker_file)
+            except (KeyboardInterrupt,SystemExit):
+                interrupted=True;result['error']='worker interrupted'
+            finally:
+                selector.close()
+                if proc.poll() is None and (interrupted or timed_out):
+                    os.killpg(proc.pid,signal.SIGINT)
+                    try: proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired: os.killpg(proc.pid,signal.SIGKILL)
+                result['returncode']=proc.wait();proc.stdout.close()
+                if buffer: events.write(buffer.decode('utf-8', errors='replace'))
     result.update(interrupted=interrupted,timed_out=timed_out,finished=now())
     save(run_dir/'execution.json',result)
     return run_dir,result
@@ -328,8 +477,7 @@ def execute(cfg,task,owner):
 
 def worker(cfg,owner):
     name_checked(owner);cfg.init();queue=Queue(cfg)
-    with (cfg.state/'workers'/(owner+'.lock')).open('a') as lock:
-        fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    with file_lock(cfg.state/'workers'/(owner+'.lock')):
         window=cfg.state/'RUN_WINDOW.json'
         deadline=load(window)['deadline_epoch'] if window.exists() else time.time()+cfg.runtime_hours*3600
         failures=0;exit_reason='queue_empty'
@@ -364,8 +512,9 @@ def worker(cfg,owner):
                 if kind in ('auth','quota') or failures>=3:
                     exit_reason=kind;break
                 if retry:
-                    until=time.monotonic()+float(cfg.data.get('workers',{}).get('retry_delay_seconds',60))
-                    save(cfg.state/'NETWORK_COOLDOWN.json',dict(until_epoch=time.time()+float(cfg.data.get('workers',{}).get('retry_delay_seconds',60))))
+                    delay=float(cfg.data.get('workers',{}).get('retry_delay_seconds',60))
+                    until=time.monotonic()+delay
+                    save(cfg.state/'NETWORK_COOLDOWN.json',dict(until_epoch=time.time()+delay))
                     while time.monotonic()<until and not (cfg.state/'STOP').exists(): time.sleep(1)
         else: exit_reason='runtime_limit'
         save(cfg.state/'workers'/(owner+'.json'),dict(worker=owner,state='stopped',reason=exit_reason,updated=now()))
@@ -377,7 +526,7 @@ def status(cfg):
     workers={}
     for path in (cfg.state/'workers').glob('*.json'):
         item=load(path);pid=item.get('pid')
-        item['process_alive']=bool(pid and Path('/proc',str(pid)).exists());workers[path.stem]=item
+        item['process_alive']=is_pid_alive(pid);workers[path.stem]=item
     return dict(project=cfg.name,total=len(rows),counts=counts,paused=(cfg.state/'STOP').exists(),
                 workers=workers,tasks=rows,state_dir=str(cfg.state))
 
@@ -425,15 +574,54 @@ StandardError=journal
 
 
 def install_services(cfg):
-    cfg.init();directory=Path.home()/'.config/systemd/user';directory.mkdir(parents=True,exist_ok=True)
-    for role in cfg.roles: (directory/unit_name(cfg,role)).write_text(unit_text(cfg,role))
+    cfg.init()
+    if IS_WINDOWS:
+        return {'runtime': 'windows-detached', 'installed': cfg.roles,
+                'note': 'Windows runs detached worker processes directly without systemd units.'}
+    directory=Path.home()/'.config/systemd/user';directory.mkdir(parents=True,exist_ok=True)
+    for role in cfg.roles: (directory/unit_name(cfg,role)).write_text(unit_text(cfg,role), encoding='utf-8')
     subprocess.run(['systemctl','--user','daemon-reload'],check=True)
     return {'installed':[unit_name(cfg,r) for r in cfg.roles]}
+
+
+def _worker_env(cfg):
+    env = cfg.env()
+    source = str(Path(__file__).resolve().parents[1])
+    existing = env.get('PYTHONPATH', '')
+    parts = [p for p in existing.split(os.pathsep) if p]
+    if source not in parts:
+        env['PYTHONPATH'] = os.pathsep.join([source, *parts])
+    return env
 
 
 def start_services(cfg):
     if (cfg.state/'STOP').exists(): raise ValueError('Batch is paused; use resume')
     save(cfg.state/'RUN_WINDOW.json',dict(started=now(),deadline_epoch=time.time()+cfg.runtime_hours*3600))
+    if IS_WINDOWS:
+        cfg.init()
+        started = []
+        env = _worker_env(cfg)
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        for role in cfg.roles:
+            wfile = cfg.state/'workers'/(role+'.json')
+            if wfile.exists():
+                info = load(wfile)
+                if info.get('state') == 'running' and is_pid_alive(info.get('pid')):
+                    started.append({'worker': role, 'pid': info.get('pid'), 'already_running': True})
+                    continue
+            log_path = cfg.state/'logs'/(role+'.log')
+            with log_path.open('a', encoding='utf-8') as log_fh:
+                proc = subprocess.Popen(
+                    [sys.executable, '-m', 'bkcodex', '--config', str(cfg.path), 'worker', '--name', role],
+                    cwd=cfg.workspace,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_fh,
+                    stderr=subprocess.STDOUT,
+                    creationflags=creationflags,
+                )
+            started.append({'worker': role, 'pid': proc.pid, 'log': str(log_path)})
+        return {'runtime': 'windows-detached', 'started': started}
     subprocess.run(['systemctl','--user','start',*[unit_name(cfg,r) for r in cfg.roles]],check=True)
     sessions=[]
     if shutil.which('tmux'):
@@ -445,12 +633,34 @@ def start_services(cfg):
     return {'started':[unit_name(cfg,r) for r in cfg.roles],'tmux':sessions}
 
 
+def stop_services(cfg, immediate=False):
+    (cfg.state/'STOP').write_text('User paused\n', encoding='utf-8')
+    result = {'paused': True, 'mode': 'interrupt' if immediate else 'after_current_task'}
+    if immediate:
+        if IS_WINDOWS:
+            killed = []
+            for path in (cfg.state/'workers').glob('*.json'):
+                info = load(path)
+                for key in ('codex_pid', 'pid'):
+                    pid = info.get(key)
+                    if is_pid_alive(pid):
+                        kill_process_tree(pid)
+                        killed.append({'worker': path.stem, 'key': key, 'pid': pid})
+            result['killed'] = killed
+        else:
+            subprocess.run(['systemctl','--user','stop',*[unit_name(cfg,r) for r in cfg.roles]],check=True)
+    return result
+
+
 def doctor(cfg):
-    linger=subprocess.run(['loginctl','show-user',str(os.getuid()),'-p','Linger','--value'],capture_output=True,text=True) if shutil.which('loginctl') else None
-    return dict(python=sys.version.split()[0],workspace_exists=cfg.workspace.is_dir(),
-        codex_binary=cfg.binary,codex_exists=Path(cfg.binary).is_file(),
+    linger = None
+    if not IS_WINDOWS and shutil.which('loginctl') and hasattr(os, 'getuid'):
+        linger = subprocess.run(['loginctl','show-user',str(os.getuid()),'-p','Linger','--value'],capture_output=True,text=True)
+    return dict(platform=sys.platform,runtime='windows-detached' if IS_WINDOWS else 'systemd',
+        python=sys.version.split()[0],workspace_exists=cfg.workspace.is_dir(),
+        codex_binary=cfg.binary,codex_exists=Path(cfg.binary).is_file() or shutil.which(cfg.binary) is not None,
         isolated_home=str(cfg.home),auth_file_exists=(cfg.home/'auth.json').is_file(),
         systemctl=bool(shutil.which('systemctl')),tmux=bool(shutil.which('tmux')),
-        linger=linger.stdout.strip() if linger else 'unavailable',
+        linger=linger.stdout.strip() if linger else ('not-applicable' if IS_WINDOWS else 'unavailable'),
         model=cfg.codex.get('model','gpt-6.1-sol'),reasoning_effort=cfg.codex.get('reasoning_effort','high'),
         service_tier=cfg.codex.get('service_tier','priority'))
