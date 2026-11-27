@@ -53,22 +53,24 @@ bkcodex --config config.local.toml import tasks/manifest.jsonl
 
 ### 3. Run Workers
 
-Choose the execution mode that matches your workflow:
-- **Detached batch (Linux `systemd` + `tmux`, or Windows detached processes)**:
-  ```bash
-  bkcodex --config config.local.toml install   # required once on Linux; no-op confirmation on Windows
-  bkcodex --config config.local.toml start
-  ```
-- **Single foreground/sub-process worker** (ideal when an agent launches a background shell task and waits for it to drain the queue and exit cleanly):
+Choose the execution mode based on OS and host runner:
+- **Windows inside an agent tool-runner, IDE task, or CI (strongly preferred)**:
+  Do **NOT** call `bkcodex start`. Many Windows subprocess runners wrap each short command in a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, which immediately terminates detached child processes when `bkcodex start` exits. Instead, launch one long-lived managed background task per worker directly:
   ```bash
   bkcodex --config config.local.toml worker --name worker-01
+  ```
+  Each worker drains the SQLite queue under its exclusive `msvcrt` lock, honors `STOP` / `stop --now` / `status`, and exits cleanly when the queue is empty. Streamed logs go to the host runner's task output rather than `state_dir/logs/<worker>.log`.
+- **Linux (`systemd` + `tmux`) or interactive Windows terminals (PowerShell / Windows Terminal)**:
+  ```bash
+  bkcodex --config config.local.toml install   # required once on Linux; initializes dirs on Windows
+  bkcodex --config config.local.toml start
   ```
 
 ### 4. Monitor, Review, and Recover
 
 ```bash
 bkcodex --config config.local.toml status
-bkcodex --config config.local.toml logs --name worker-01 --tail 80
+bkcodex --config config.local.toml logs --name worker-01 --tail 80  # Linux journalctl or Windows `start` mode; in direct `worker` mode read host task output + run_dir
 ```
 
 When a task finishes, always inspect its `run_dir` from `status`:
@@ -94,6 +96,7 @@ bkcodex --config config.local.toml resume         # clear STOP marker and restar
 
 ## Platform Notes & Common Pitfalls
 
+- **Windows Job Object reaping**: Agent/IDE/CI subprocess runners commonly terminate all processes in a command's Windows Job Object as soon as that command returns. Always run `bkcodex worker --name <role>` as a managed background task in those environments instead of `bkcodex start`.
 - **Windows Codex binary**: If an older global npm `codex` fails to parse newer `~/.codex/config.toml` keys (such as newer `reasoning_effort` values), point `codex.binary` to the Codex Desktop executable (`C:/Program Files/WindowsApps/OpenAI.Codex_.../app/resources/codex.exe`) or update the CLI.
 - **Windows paths & encoding**: Prefer forward slashes (`C:/path/to/codex.exe`) or escaped backslashes in TOML strings. `bkcodex` sets `PYTHONUTF8=1` and reads/writes all JSON, prompts, and logs as UTF-8.
 - **CLI flags**: Keep `global_args = ["--no-daemon"]` only if the installed Codex CLI supports it; otherwise set `global_args = []`.

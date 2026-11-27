@@ -3,7 +3,7 @@
 把 Codex CLI 任务放到后台持续运行，支持 **Linux** 和 **Windows**。适合批量标注、代码开发与维护、材料检查和其他可拆成独立任务的工作。
 
 - **Linux**：后台由 **systemd 用户服务**管理，**tmux** 与 `journalctl` 查看实时进度。关闭 VS Code 或断开 SSH 后，服务器继续执行。
-- **Windows**：原生使用脱离后台进程（`DETACHED_PROCESS` + `msvcrt` 文件锁 + Win32 进程树管理），日志自动落盘到 `state_dir/logs/<worker>.log`。
+- **Windows**：原生使用 `msvcrt` 文件锁、Win32 进程树管理与 UTF-8 管道。在交互式终端中可用 `bkcodex start` 拉起脱离后台进程（日志写入 `state_dir/logs/<worker>.log`）；在 AI 智能体、IDE 子命令或 CI 等带作业对象（Job Object）回收机制的环境中，应直接由宿主后台任务托管 `bkcodex worker --name worker-01`。
 
 每项任务使用独立会话，已有进度通过文件和检查点接续，账号与会话记录保存在配置目录。运行环境：Linux 或 Windows、Python 3.11+、Codex CLI。Python 运行时仅使用标准库，零第三方依赖。
 
@@ -58,6 +58,10 @@ sudo loginctl enable-linger "$USER"
 ```
 
 Linux 下 `bkcodex doctor` 的 `linger` 应显示 `yes`；Windows 下 `runtime` 显示 `windows-detached`、`linger` 显示 `not-applicable`。各工作进程会从队列领取不同任务，完成当前任务后继续领取，队列处理完毕后自动退出。
+
+> **Windows 运行模式提示（重要）**：
+> - **交互式终端（Windows Terminal / PowerShell / cmd）**：可直接执行 `bkcodex start` 拉起脱离后台进程，日志自动写入 `state_dir/logs/<worker>.log`，用 `bkcodex logs` 查看。
+> - **AI 智能体 / IDE 子命令 / CI runner**：这类宿主通常会为每次短命令附加带 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 Windows 作业对象（Job Object），`bkcodex start` 退出时会连带回收脱离进程。在此类环境中请**不要调用 `bkcodex start`**，改由宿主的后台任务机制直接托管运行 `bkcodex worker --name worker-01`（需并发时分别托管 `worker-01`、`worker-02` 等）。队列、独占锁、`status`、`stop` / `stop --now` 与 `runs/` 记录行为完全一致，队列清空后自动退出。
 
 ## Agent Skill（供智能体调用）
 
@@ -147,15 +151,17 @@ bkcodex retry job-001 # 把受阻任务重新放入队列
 bkcodex resume        # 清除暂停标记并启动
 ```
 
-也可直接以前台单 worker 模式运行（队列清空后自动退出，便于被上层智能体或脚本调度）：
+也可直接以托管单 worker 模式运行（队列清空后自动退出；**Windows 下由智能体、IDE 子命令或 CI 调度时应优先使用此模式**，避免 `start` 脱离进程被 Windows 作业对象回收）：
 
 ```bash
 bkcodex worker --name worker-01
 ```
 
+该模式下输出直接由宿主任务日志接管（不额外写入 `state_dir/logs/<worker>.log`），进度与回执仍可通过 `bkcodex status` 与 `runs/<task>/<invocation>/` 查看，暂停/终止同样使用 `bkcodex stop` 或 `bkcodex stop --now`。
+
 发生网络错误时，工作进程使用有限重试和共享等待时间。登录失效、额度不足或连续三次失败会使对应工作进程保存退出。修复后可用 `retry` 和 `resume` 接续。进程被强制终止时，已写入磁盘的记录保留；下一次启动读取此前的运行目录。
 
-Linux 下 `install` 写入用户服务，`start` 启动本批任务；Windows 下 `install` 仅初始化目录，`start` 直接拉起脱离后台进程。
+Linux 下 `install` 写入用户服务，`start` 交由 `systemd` 守护进程启动；Windows 交互式终端下 `install` 仅初始化目录，`start` 直接拉起脱离后台进程。
 
 ## 文件结构
 
