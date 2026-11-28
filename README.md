@@ -1,5 +1,7 @@
 # bkcodex
 
+> 鉴于 GPT 说话越来越像古神低语，为了保护个人 SAN 值，决定把它改成自动驾驶——交由主控智能体在后台代为调度和验收。
+
 面向 **AI 智能体（Agent）编排与调度** 的 Codex CLI 后台任务运行器，支持 **Linux** 和 **Windows**。主要用途是让主控智能体（如 Antigravity、Claude Code、Codex CLI、Cursor、Gemini CLI 等）将批量标注、代码开发与维护、材料检查等可拆分的长任务，派发给多个独立的后台 Codex CLI worker 持续执行、自动验收并输出结构化回执。
 
 - **专为 Agent 调用设计**：通过内置标准 Agent Skill（[skills/bkcodex/SKILL.md](skills/bkcodex/SKILL.md)）驱动，主控智能体负责拆解任务、隔离文件边界、入队、启动与复核 `result.json` / `receipt.json`；人工通常只需完成首次环境配置与登录，或按需查看状态与介入。
