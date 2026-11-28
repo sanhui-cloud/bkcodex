@@ -1,13 +1,36 @@
 # bkcodex
 
-把 Codex CLI 任务放到后台持续运行，支持 **Linux** 和 **Windows**。适合批量标注、代码开发与维护、材料检查和其他可拆成独立任务的工作。
+面向 **AI 智能体（Agent）编排与调度** 的 Codex CLI 后台任务运行器，支持 **Linux** 和 **Windows**。主要用途是让主控智能体（如 Antigravity、Claude Code、Codex CLI、Cursor、Gemini CLI 等）将批量标注、代码开发与维护、材料检查等可拆分的长任务，派发给多个独立的后台 Codex CLI worker 持续执行、自动验收并输出结构化回执。
 
+- **专为 Agent 调用设计**：通过内置标准 Agent Skill（[skills/bkcodex/SKILL.md](skills/bkcodex/SKILL.md)）驱动，主控智能体负责拆解任务、隔离文件边界、入队、启动与复核 `result.json` / `receipt.json`；人工通常只需完成首次环境配置与登录，或按需查看状态与介入。
 - **Linux**：后台由 **systemd 用户服务**管理，**tmux** 与 `journalctl` 查看实时进度。关闭 VS Code 或断开 SSH 后，服务器继续执行。
-- **Windows**：原生使用 `msvcrt` 文件锁、Win32 进程树管理与 UTF-8 管道。在交互式终端中可用 `bkcodex start` 拉起脱离后台进程（日志写入 `state_dir/logs/<worker>.log`）；在 AI 智能体、IDE 子命令或 CI 等带作业对象（Job Object）回收机制的环境中，应直接由宿主后台任务托管 `bkcodex worker --name worker-01`。
+- **Windows**：原生使用 `msvcrt` 文件锁、Win32 进程树管理与 UTF-8 管道。在 AI 智能体、IDE 子命令或 CI 等带作业对象（Job Object）回收机制的环境中，应直接由宿主后台任务托管 `bkcodex worker --name worker-01`；在交互式终端中也可用 `bkcodex start` 拉起脱离后台进程（日志写入 `state_dir/logs/<worker>.log`）。
 
 每项任务使用独立会话，已有进度通过文件和检查点接续，账号与会话记录保存在配置目录。运行环境：Linux 或 Windows、Python 3.11+、Codex CLI。Python 运行时仅使用标准库，零第三方依赖。
 
-## 快速开始
+## Agent Skill（供智能体直接调用，推荐入口）
+
+**本仓库主要供 AI 智能体调用，而非仅作为手工命令行工具使用。** 仓库内置了标准跨平台 Agent Skill：[skills/bkcodex/SKILL.md](skills/bkcodex/SKILL.md)，方便 **Antigravity、Codex CLI、Claude Code、Cursor、Gemini CLI** 等主控智能体按统一协议编排后台 Codex worker，自动完成从任务拆分到结果验收的闭环。
+
+### 1. 将 Skill 接入你的智能体
+
+按你使用的智能体任选其一，将 `skills/bkcodex` 复制或软链接到对应 skills 目录：
+
+- **项目级工作区**（推荐团队共享）：复制到项目根目录 `.agents/skills/bkcodex/SKILL.md`
+- **Codex CLI 全局**：复制到 `~/.codex/skills/bkcodex/SKILL.md`
+- **Claude Code 全局**：复制到 `~/.claude/skills/bkcodex/SKILL.md`
+- **Antigravity 全局**：复制到 `~/.gemini/antigravity/skills/bkcodex/SKILL.md`
+
+### 2. 智能体接入后会自动做什么
+
+完成下方一次性的环境安装与登录配置后，直接对主控智能体下达高层目标（例如：“使用 `bkcodex` 将这些任务拆分并派发到后台 Codex worker 执行与验收”），智能体会按 `SKILL.md` 规范自动完成：
+
+1. **环境预检**：执行 `bkcodex doctor`，核对工作区、Codex CLI 路径、凭据状态与当前平台运行模式；
+2. **无冲突拆分与入队**：为并行 worker 严格划分不重叠的文件范围，编写任务提示词与可选 `payload.json`，通过 `enqueue` / `import` 写入 SQLite 队列；
+3. **按平台安全启动 worker**：Linux 下使用 `systemd`（`install` / `start`），Windows 智能体环境下直接由宿主后台任务托管 `bkcodex worker --name <role>`（避免 `start` 脱离进程被 Windows Job Object 回收）；
+4. **巡检、验收与接续**：轮询或等待完成后核对 `status`、`result.json`、`receipt.json` 与 `validation.log`，异常时读取 `CHECKPOINT.json` 并通过 `retry` / `resume` 恢复。
+
+## 环境安装与初始化（首次配置）
 
 ### Linux
 
@@ -42,7 +65,7 @@ bkcodex doctor
 - `login` 通过 Codex 的设备授权流程登录；凭据由 Codex 管理，存放在配置的 `codex.home` 中。仓库忽略本地配置、凭据、日志和运行记录。
 - **Windows 提示**：如果本地已登录 Codex Desktop，也可将 `codex.home` 指向 `~/.codex` 并把 `codex.binary` 指向对应 `codex.exe`（TOML 中建议使用正斜杠 `/`）。`bkcodex init` 不会覆盖已有的 `config.toml`。
 
-提交示例任务并启动：
+如需手工验证示例任务，可执行：
 
 ```bash
 bkcodex import examples/tasks.jsonl
@@ -60,21 +83,8 @@ sudo loginctl enable-linger "$USER"
 Linux 下 `bkcodex doctor` 的 `linger` 应显示 `yes`；Windows 下 `runtime` 显示 `windows-detached`、`linger` 显示 `not-applicable`。各工作进程会从队列领取不同任务，完成当前任务后继续领取，队列处理完毕后自动退出。
 
 > **Windows 运行模式提示（重要）**：
+> - **AI 智能体 / IDE 子命令 / CI runner（优先使用 `worker`）**：这类宿主通常会为每次短命令附加带 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 Windows 作业对象（Job Object），`bkcodex start` 退出时会连带回收脱离进程。在此类环境中请**不要调用 `bkcodex start`**，改由宿主的后台任务机制直接托管运行 `bkcodex worker --name worker-01`（需并发时分别托管 `worker-01`、`worker-02` 等）。队列、独占锁、`status`、`stop` / `stop --now` 与 `runs/` 记录行为完全一致，队列清空后自动退出。
 > - **交互式终端（Windows Terminal / PowerShell / cmd）**：可直接执行 `bkcodex start` 拉起脱离后台进程，日志自动写入 `state_dir/logs/<worker>.log`，用 `bkcodex logs` 查看。
-> - **AI 智能体 / IDE 子命令 / CI runner**：这类宿主通常会为每次短命令附加带 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 Windows 作业对象（Job Object），`bkcodex start` 退出时会连带回收脱离进程。在此类环境中请**不要调用 `bkcodex start`**，改由宿主的后台任务机制直接托管运行 `bkcodex worker --name worker-01`（需并发时分别托管 `worker-01`、`worker-02` 等）。队列、独占锁、`status`、`stop` / `stop --now` 与 `runs/` 记录行为完全一致，队列清空后自动退出。
-
-## Agent Skill（供智能体调用）
-
-仓库内置标准 Agent Skill 文件：[skills/bkcodex/SKILL.md](skills/bkcodex/SKILL.md)，方便 **Antigravity、Codex CLI、Claude Code、Cursor、Gemini CLI** 等智能体按规范自动完成任务拆分、入队、启动、巡检、结果验收与失败恢复。
-
-接入方式（按你使用的智能体任选其一，将 `skills/bkcodex` 复制或软链接到对应 skills 目录）：
-
-- **项目级工作区**（推荐团队共享）：复制到项目根目录 `.agents/skills/bkcodex/SKILL.md`
-- **Codex CLI 全局**：复制到 `~/.codex/skills/bkcodex/SKILL.md`
-- **Claude Code 全局**：复制到 `~/.claude/skills/bkcodex/SKILL.md`
-- **Antigravity 全局**：复制到 `~/.gemini/antigravity/skills/bkcodex/SKILL.md`
-
-接入后，直接对智能体说“使用 `bkcodex` 将这些任务拆分并派发到后台 Codex worker 执行与验收”，智能体即会按 Skill 规范自动检查 `doctor`、分配不冲突的文件范围、写 `payload.json`、触发验收并汇报 `result.json`。
 
 ## 配置入口
 
